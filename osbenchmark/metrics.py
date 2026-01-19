@@ -1899,6 +1899,9 @@ class GlobalStatsCalculator:
         result.total_transform_search_times = self.total_transform_metric("total_transform_search_time")
         result.total_transform_throughput = self.total_transform_metric("total_transform_throughput")
 
+        self.logger.debug("Gathering repositories stats.")
+        result.repositories_stats = self._collect_repositories_stats()
+
         return result
 
     def merge(self, *args):
@@ -2000,6 +2003,52 @@ class GlobalStatsCalculator:
                     })
         return result
 
+    def _collect_repositories_stats(self):
+        """
+        Collect repositories stats from metrics store.
+        Returns a list of repositories stats metrics grouped by repository and operation.
+        """
+        repos_stats = []
+
+        repos_docs = self.store.get_raw("repositories-stats-diff")
+
+        if repos_docs:
+            grouped = {}
+            for doc in repos_docs:
+                meta = doc.get("meta", {})
+                # Try to get repository and operation from meta first, then from doc as fallback
+                repo_name = meta.get("repository") or doc.get("repository", "unknown")
+                operation = meta.get("operation") or doc.get("operation", "unknown")
+                key = f"{repo_name}_{operation}"
+
+                if key not in grouped:
+                    grouped[key] = {
+                        "repository": repo_name,
+                        "operation": operation,
+                        "request_time": None,
+                        "request_success": None,
+                        "request_failures": None,
+                        "request_retries": None,
+                        "unit": "ms"
+                    }
+
+                # Extract values from the document
+                # Note: These fields are stored directly in the doc by RepositoriesStats
+                if "request_time_in_millis" in doc:
+                    grouped[key]["request_time"] = doc["request_time_in_millis"]
+                if "request_success_total" in doc:
+                    grouped[key]["request_success"] = doc["request_success_total"]
+                if "request_failures_total" in doc:
+                    grouped[key]["request_failures"] = doc["request_failures_total"]
+                if "request_retry_count_total" in doc:
+                    grouped[key]["request_retries"] = doc["request_retry_count_total"]
+                if "unit" in doc:
+                    grouped[key]["unit"] = doc["unit"]
+
+            repos_stats = list(grouped.values())
+
+        return repos_stats
+
     def error_rate(self, task_name, operation_type):
         return self.store.get_error_rate(task=task_name, operation_type=operation_type, sample_type=SampleType.Normal)
 
@@ -2086,6 +2135,8 @@ class GlobalStats:
         self.total_transform_processing_times = self.v(d, "total_transform_processing_times")
         self.total_transform_throughput = self.v(d, "total_transform_throughput")
 
+        self.repositories_stats = self.v(d, "repositories_stats", default=[])
+
     def as_dict(self):
         return self.__dict__
 
@@ -2161,6 +2212,19 @@ class GlobalStats:
                         "name": metric,
                         "value": {
                             "single": item["mean"]
+                        }
+                    })
+            elif metric == "repositories_stats" and value is not None:
+                for item in value:
+                    all_results.append({
+                        "repository": item["repository"],
+                        "operation": item["operation"],
+                        "name": "repositories_stats",
+                        "value": {
+                            "request_time": item.get("request_time"),
+                            "request_success": item.get("request_success"),
+                            "request_failures": item.get("request_failures"),
+                            "request_retries": item.get("request_retries")
                         }
                     })
             elif metric.endswith("_time_per_shard"):

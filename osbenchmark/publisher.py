@@ -163,6 +163,8 @@ class SummaryResultsPublisher:
 
         metrics_table.extend(self._publish_transform_stats(stats))
 
+        metrics_table.extend(self._publish_repositories_stats(stats))
+
         # These variables are used with the clients_list parameter in test_procedures to find the max throughput.
         max_throughput = -1
         record_with_best_throughput = None
@@ -381,6 +383,43 @@ class SummaryResultsPublisher:
         for throughput in stats.total_transform_throughput:
             lines.append(
                 self._line("Transform throughput", throughput["id"], throughput["mean"], throughput["unit"]))
+
+        return lines
+
+    def _publish_repositories_stats(self, stats):
+        """
+        Publish repositories stats (S3, etc.) metrics.
+        """
+        lines = []
+        if stats.repositories_stats is None or not stats.repositories_stats:
+            return lines
+
+        for repo_stat in stats.repositories_stats:
+            repo_name = repo_stat["repository"]
+            operation = repo_stat["operation"]
+            task_label = f"{repo_name}/{operation}"
+            unit = repo_stat.get("unit", "ms")
+
+            if repo_stat.get("request_time") is not None:
+                lines.append(
+                    self._line("Repositories request time", task_label,
+                               repo_stat["request_time"], unit)
+                )
+            if repo_stat.get("request_success") is not None:
+                lines.append(
+                    self._line("Repositories request success", task_label,
+                               repo_stat["request_success"], "")
+                )
+            if repo_stat.get("request_failures") is not None:
+                lines.append(
+                    self._line("Repositories request failures", task_label,
+                               repo_stat["request_failures"], "")
+                )
+            if repo_stat.get("request_retries") is not None:
+                lines.append(
+                    self._line("Repositories request retries", task_label,
+                               repo_stat["request_retries"], "")
+                )
 
         return lines
 

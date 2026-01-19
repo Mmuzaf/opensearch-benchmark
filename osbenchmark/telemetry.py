@@ -42,7 +42,8 @@ def list_telemetry():
                                                                                Heapdump, NodeStats, RecoveryStats,
                                                                                CcrStats, SegmentStats, TransformStats,
                                                                                SearchableSnapshotsStats,
-                                                                               SegmentReplicationStats, ShardStats]]
+                                                                               SegmentReplicationStats, ShardStats,
+                                                                               RepositoriesStats]]
     console.println(tabulate.tabulate(devices, ["Command", "Name", "Description"]))
     console.println("\nKeep in mind that each telemetry device may incur a runtime overhead which can skew results.")
 
@@ -1945,3 +1946,221 @@ class SegmentReplicationStatsRecorder:
         }
 
         self.metrics_store.put_doc(doc, level=MetaInfoScope.cluster, meta_data=meta_data)
+
+
+class RepositoriesStats(TelemetryDevice):
+    internal = False
+    command = "repositories-stats"
+    human_name = "Repositories Stats"
+    help = "Collects repository stats (S3, etc.) before and after benchmark, showing the difference"
+
+    def __init__(self, clients, metrics_store):
+        super().__init__()
+        self.clients = clients
+        self.metrics_store = metrics_store
+        self.specified_cluster_names = self.clients.keys()
+        self.repositories_stats_per_node = {}
+
+    def on_benchmark_start(self):
+        """
+        Collect repositories stats at the start of the benchmark.
+        Store initial values for later diff calculation.
+        """
+        self.logger.info("Collecting initial repositories stats")
+        self.repositories_stats_per_node = self._collect_repositories_stats()
+
+    def on_benchmark_stop(self):
+        """
+        Collect repositories stats at the end of the benchmark.
+        Calculate and store the difference (end - start).
+        """
+        self.logger.info("Collecting final repositories stats and calculating differences")
+        repositories_stats_at_end = self._collect_repositories_stats()
+
+        for cluster_name in self.specified_cluster_names:
+            cluster_start_stats = self.repositories_stats_per_node.get(cluster_name, {})
+            cluster_end_stats = repositories_stats_at_end.get(cluster_name, {})
+
+            for node_name, node_end_stats in cluster_end_stats.items():
+                node_start_stats = cluster_start_stats.get(node_name, {})
+
+                for repo_name, repo_end_stats in node_end_stats.items():
+                    repo_start_stats = node_start_stats.get(repo_name, {})
+
+                    operations = ["ListObjects", "PutMultipartObject",
+                                  "DeleteObjects", "PutObject", "GetObject"]
+
+                    for operation in operations:
+                        end_time = repo_end_stats.get("request_time_in_millis", {}).get(operation, 0)
+                        start_time = repo_start_stats.get("request_time_in_millis", {}).get(operation, 0)
+                        diff_time = max(end_time - start_time, 0)
+
+                        end_success = repo_end_stats.get("request_success_total", {}).get(operation, 0)
+                        start_success = repo_start_stats.get("request_success_total", {}).get(operation, 0)
+                        diff_success = max(end_success - start_success, 0)
+
+                        end_failures = repo_end_stats.get("request_failures_total", {}).get(operation, 0)
+                        start_failures = repo_start_stats.get("request_failures_total", {}).get(operation, 0)
+                        diff_failures = max(end_failures - start_failures, 0)
+
+                        end_retries = repo_end_stats.get("request_retry_count_total", {}).get(operation, 0)
+                        start_retries = repo_start_stats.get("request_retry_count_total", {}).get(operation, 0)
+                        diff_retries = max(end_retries - start_retries, 0)
+
+                        if diff_time > 0 or diff_success > 0 or diff_failures > 0 or diff_retries > 0:
+                            metric_prefix = f"repositories_{repo_name}_{operation}"
+
+                            if diff_time > 0:
+                                self.metrics_store.put_value_node_level(
+                                    node_name,
+                                    f"{metric_prefix}_request_time",
+                                    diff_time,
+                                    "ms",
+                                    meta_data={
+                                        "cluster": cluster_name,
+                                        "repository": repo_name,
+                                        "operation": operation
+                                    }
+                                )
+
+                            if diff_success > 0:
+                                self.metrics_store.put_value_node_level(
+                                    node_name,
+                                    f"{metric_prefix}_request_success",
+                                    diff_success,
+                                    meta_data={
+                                        "cluster": cluster_name,
+                                        "repository": repo_name,
+                                        "operation": operation
+                                    }
+                                )
+
+                            if diff_failures > 0:
+                                self.metrics_store.put_value_node_level(
+                                    node_name,
+                                    f"{metric_prefix}_request_failures",
+                                    diff_failures,
+                                    meta_data={
+                                        "cluster": cluster_name,
+                                        "repository": repo_name,
+                                        "operation": operation
+                                    }
+                                )
+
+                            if diff_retries > 0:
+                                self.metrics_store.put_value_node_level(
+                                    node_name,
+                                    f"{metric_prefix}_request_retries",
+                                    diff_retries,
+                                    meta_data={
+                                        "cluster": cluster_name,
+                                        "repository": repo_name,
+                                        "operation": operation
+                                    }
+                                )
+
+                            # Also store as a document for detailed view
+                            doc = {
+                                "name": "repositories-stats-diff",
+                                "repository": repo_name,
+                                "operation": operation,
+                                "request_time_in_millis": diff_time,
+                                "request_success_total": diff_success,
+                                "request_failures_total": diff_failures,
+                                "request_retry_count_total": diff_retries,
+                                "unit": "ms"
+                            }
+
+                            meta_data = {
+                                "cluster": cluster_name,
+                                "node_name": node_name,
+                                "repository": repo_name,
+                                "operation": operation
+                            }
+
+                            self.metrics_store.put_doc(
+                                doc,
+                                level=MetaInfoScope.node,
+                                node_name=node_name,
+                                meta_data=meta_data
+                            )
+
+        self.repositories_stats_per_node = None
+
+    def _collect_repositories_stats(self):
+        """
+        Collect repositories stats from all clusters and nodes.
+        Returns a nested dict: {cluster_name: {node_name: {repo_name: stats}}}
+
+        Note: repositories is a LIST, not a dict!
+        """
+        all_stats = {}
+
+        for cluster_name in self.specified_cluster_names:
+            client = self.clients[cluster_name]
+            cluster_stats = {}
+
+            try:
+                stats = client.nodes.stats(metric="repositories")
+
+                if not isinstance(stats, dict):
+                    self.logger.warning("Unexpected response type from nodes.stats: %s", type(stats))
+                    continue
+
+                nodes = stats.get("nodes", {})
+
+                if not isinstance(nodes, dict):
+                    self.logger.warning("Unexpected nodes structure: %s (expected dict, got %s)", nodes, type(nodes))
+                    continue
+
+                for node_id, node_data in nodes.items():
+                    if not isinstance(node_data, dict):
+                        continue
+
+                    node_name = node_data.get("name", node_id)
+
+                    # IMPORTANT: repositories is a LIST, not a dict!
+                    repositories = node_data.get("repositories", [])
+
+                    if not isinstance(repositories, list):
+                        self.logger.debug("No repositories stats for node [%s] (type: %s)", node_name,
+                                          type(repositories))
+                        continue
+
+                    if repositories:
+                        cluster_stats[node_name] = {}
+
+                        for repo_data in repositories:
+                            if not isinstance(repo_data, dict):
+                                continue
+
+                            repo_name = repo_data.get("repository_name", "unknown")
+
+                            cluster_stats[node_name][repo_name] = {
+                                "request_time_in_millis": repo_data.get("request_time_in_millis", {}),
+                                "request_success_total": repo_data.get("request_success_total", {}),
+                                "request_failures_total": repo_data.get("request_failures_total", {}),
+                                "request_retry_count_total": repo_data.get("request_retry_count_total", {}),
+                                "repository_type": repo_data.get("repository_type", "unknown")
+                            }
+
+            except opensearchpy.TransportError as e:
+                self.logger.exception(
+                    "Could not retrieve repositories stats for cluster [%s]: %s",
+                    cluster_name, str(e)
+                )
+            except KeyError as e:
+                self.logger.debug(
+                    "Repositories stats not available for cluster [%s]: %s",
+                    cluster_name, str(e)
+                )
+            except Exception as e:
+                self.logger.exception(
+                    "Unexpected error collecting repositories stats for cluster [%s]: %s",
+                    cluster_name, str(e)
+                )
+
+            if cluster_stats:
+                all_stats[cluster_name] = cluster_stats
+
+        return all_stats
